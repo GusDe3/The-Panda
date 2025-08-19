@@ -252,5 +252,6 @@ async def command_counters(ctx, id1: str, id2: str, id3: str):
         await ctx.send("Une erreur s'est produite dans la commande.")
 
 # Exporter bot pour être utilisé par start.py
-
+keep_alive()
 bot  # Assure que bot est disponible à l'importation
+
