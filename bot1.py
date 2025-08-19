@@ -9,6 +9,7 @@ from datetime import timedelta
 from dateutil.parser import parse
 from collections import Counter
 import logging
+from keep_alive import keep_alive
 
 load_dotenv()
 # Set up logging
@@ -251,4 +252,5 @@ async def command_counters(ctx, id1: str, id2: str, id3: str):
         await ctx.send("Une erreur s'est produite dans la commande.")
 
 # Exporter bot pour être utilisé par start.py
+
 bot  # Assure que bot est disponible à l'importation
