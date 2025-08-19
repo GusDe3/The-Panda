@@ -1,12 +1,12 @@
 import os
 import logging
 import threading
-import requests
 import time
 import asyncio  # Import explicite pour éviter tout doute
 from dotenv import load_dotenv
 import gspread
 from google.oauth2 import service_account
+import requests  # Conservé pour les appels à l'API Brawl Stars
 
 # Load environment variables
 load_dotenv()
@@ -104,13 +104,18 @@ def update_sheet():
     finally:
         logging.info("Data update thread completed.")
 
-# Lancer la mise à jour dans un thread
+# Lancer la mise à jour dans un thread avec boucle
 def run_data_update():
-    logging.info("Starting data update thread...")
-    try:
-        update_sheet()
-    except Exception as e:
-        logging.error(f"Error in data update thread: {e}")
+    logging.info("Starting data update thread with hourly loop...")
+    last_run = 0
+    while True:
+        current_time = time.time()
+        if current_time - last_run >= 3600:  # 1 heure (3600 secondes)
+            logging.info("Starting data update cycle...")
+            update_sheet()
+            last_run = current_time
+            logging.info("Waiting 1 hour before next update...")
+        time.sleep(300)  # Vérifier toutes les 5 minutes (aligné avec ton ping)
 
 # Fonction pour démarrer le bot
 def start_bot():
@@ -128,16 +133,16 @@ def start_bot():
 
 def main():
     # Lancer la mise à jour des données dans un thread
-    data_thread = threading.Thread(target=run_data_update)
+    data_thread = threading.Thread(target=run_data_update, daemon=True)
     data_thread.start()
     
     # Lancer le bot dans un thread séparé
-    bot_thread = threading.Thread(target=start_bot)
+    bot_thread = threading.Thread(target=start_bot, daemon=True)
     bot_thread.start()
     
-    # Attendre la fin des threads
-    data_thread.join()
-    bot_thread.join()
+    # Laisser les threads tourner en arrière-plan
+    while True:
+        time.sleep(60)  # Boucle principale pour garder le script actif
 
 if __name__ == "__main__":
     main()
