@@ -1,0 +1,10 @@
+discord.py
+gspread
+google-auth-httplib2
+google-auth-oauthlib
+python-dateutil
+flask
+python-dotenv
+requests
+aiohttp
+gspread_asyncio
