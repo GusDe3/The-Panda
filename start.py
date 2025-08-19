@@ -142,7 +142,8 @@ def main():
     
     # Laisser les threads tourner en arrière-plan
     while True:
-        time.sleep(60)  # Boucle principale pour garder le script actif
+        time.sleep(30)  # Boucle principale pour garder le script actif
 
 if __name__ == "__main__":
     main()
+
