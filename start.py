@@ -53,7 +53,7 @@ def update_sheet():
         for i, match in enumerate(all_matches, start=2):  # Commence à 2 pour ignorer l'en-tête
             battle_time = datetime.strptime(match['BattleTime'], '%Y%m%dT%H%M%S.000Z')
             if battle_time >= thirty_days_ago:
-                valid_matches.append([match['PlayerTag'], match['BattleTime'], match['event_mode'], match['event_map'], match['brawler_name'], match['result'], match['trophy_change']])
+                valid_matches.append([match['PlayerTag'], match['BattleTime'], match['EventMode'], match['EventMap'], match['BrawlerName'], match['Result'], match['Trophy Change']])
             else:
                 rows_to_delete.append(i)
 
@@ -67,7 +67,7 @@ def update_sheet():
         # Réécrire les matchs valides pour combler les vides
         if valid_matches:
             matches_worksheet.clear()  # Vider la feuille
-            matches_worksheet.append_row(['PlayerTag', 'BattleTime', 'event_mode', 'event_map', 'brawler_name', 'result', 'trophy_change'])  # Réinsérer l'en-tête
+            matches_worksheet.append_row(['PlayerTag', 'BattleTime', 'EventMode', 'EventMap', 'BrawlerName', 'Result', 'Trophy Change'])  # Réinsérer l'en-tête
             for match in valid_matches:
                 matches_worksheet.append_row(match)
             logging.info(f"Reorganized {len(valid_matches)} valid entries.")
