@@ -44,7 +44,8 @@ def update_sheet():
         rows_to_delete = []
         write_count = 0
         for i, match in enumerate(all_matches, start=2):
-            battle_time = datetime.strptime(match['BattleTime'], '%Y%m%dT%H%M%S.000Z')
+            # Correction: Ajouter le fuseau horaire UTC à la date parsée
+            battle_time = datetime.strptime(match['BattleTime'], '%Y%m%dT%H%M%S.000Z').replace(tzinfo=UTC)
             logging.info(f"Checking BattleTime: {match['BattleTime']} (parsed: {battle_time})")
             if battle_time < thirty_days_ago:
                 rows_to_delete.append(i)
