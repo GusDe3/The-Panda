@@ -45,31 +45,44 @@ def update_sheet():
         # Récupérer toutes les lignes existantes
         all_matches = matches_worksheet.get_all_records()
         current_time = datetime.utcnow()
+        logging.info(f"Current time (UTC): {current_time}")
         thirty_days_ago = current_time - timedelta(days=30)
+        logging.info(f"Thirty days ago (UTC): {thirty_days_ago}")
 
         # Identifier les lignes à conserver (moins de 30 jours) et à supprimer
         valid_matches = []
         rows_to_delete = []
+        write_count = 0  # Compteur de requêtes d'écriture
         for i, match in enumerate(all_matches, start=2):  # Commence à 2 pour ignorer l'en-tête
             battle_time = datetime.strptime(match['BattleTime'], '%Y%m%dT%H%M%S.000Z')
-            if battle_time >= thirty_days_ago:
-                valid_matches.append([match['PlayerTag'], match['BattleTime'], match['EventMode'], match['EventMap'], match['BrawlerName'], match['Result'], match['Trophy Change']])
-            else:
+            logging.info(f"Checking BattleTime: {match['BattleTime']} (parsed: {battle_time})")
+            if battle_time < thirty_days_ago:  # Seulement supprimer si plus vieux que 30 jours
                 rows_to_delete.append(i)
+                logging.info(f"Marked for deletion: {match['BattleTime']}")
+            else:
+                valid_matches.append([match['PlayerTag'], match['BattleTime'], match['EventMode'], match['EventMap'], match['BrawlerName'], match['Result'], match['Trophy Change']])
+                logging.info(f"Kept: {match['BattleTime']}")
 
-        # Supprimer les anciennes lignes
+        # Supprimer les anciennes lignes en lots si possible
         if rows_to_delete:
             logging.info(f"Deleting {len(rows_to_delete)} old entries...")
             for row in sorted(rows_to_delete, reverse=True):
-                matches_worksheet.delete_rows(row, row)  # Use delete_rows for single row
+                matches_worksheet.delete_rows(row, row)
+                write_count += 1
+                if write_count % 60 == 0:  # Limite de 60 écritures par minute
+                    logging.info("Approaching write limit, waiting 60 seconds...")
+                    time.sleep(60)
             logging.info(f"Deleted old entries successfully.")
 
-        # Réécrire les matchs valides pour combler les vides
+        # Réécrire les matchs valides en une seule requête
         if valid_matches:
-            matches_worksheet.clear()  # Vider la feuille
-            matches_worksheet.append_row(['PlayerTag', 'BattleTime', 'EventMode', 'EventMap', 'BrawlerName', 'Result', 'Trophy Change'])  # Réinsérer l'en-tête
-            for match in valid_matches:
-                matches_worksheet.append_row(match)
+            matches_worksheet.clear()  # 1 écriture
+            write_count += 1
+            matches_worksheet.append_row(['PlayerTag', 'BattleTime', 'EventMode', 'EventMap', 'BrawlerName', 'Result', 'Trophy Change'])  # 1 écriture
+            write_count += 1
+            if valid_matches:
+                matches_worksheet.update('A2', valid_matches)  # Écrire toutes les lignes en une seule requête
+                write_count += 1
             logging.info(f"Reorganized {len(valid_matches)} valid entries.")
 
         # Ajouter les nouveaux matchs
@@ -79,7 +92,7 @@ def update_sheet():
         BS_TOKEN = os.getenv('B')
         headers = {'Authorization': f'Bearer {BS_TOKEN}'}
 
-        new_matches_added = False
+        new_matches = []
         for player in players:
             tag = player.strip().lstrip('#').upper()
             url = f'https://api.brawlstars.com/v1/players/%23{tag}/battlelog'
@@ -121,20 +134,21 @@ def update_sheet():
                     if trophy_change != 0:
                         logging.info(f"Skipped non-friendly match for {player} at {battle_time} (trophyChange = {trophy_change})")
                         continue
-                    row = [player, battle_time, event_mode, event_map, brawler_name, result, str(trophy_change)]
-                    matches_worksheet.append_row(row)
-                    logging.info(f'Added new friendly match for {player} at {battle_time}')
-                    new_matches_added = True
-                    time.sleep(1)  # Pause pour respecter la limite de 60 écritures/minute
-            except requests.exceptions.RequestException as e:
-                logging.error(f"HTTP error for {player}: {e}")
-            except Exception as e:
-                logging.error(f"Unexpected error for {player}: {e}")
-                if '429' in str(e):
-                    logging.warning("Quota limit reached, waiting 60 seconds...")
+                    new_matches.append([player, battle_time, event_mode, event_map, brawler_name, result, str(trophy_change)])
+
+        # Ajouter les nouveaux matchs par lots
+        if new_matches:
+            batch_size = 50  # Ajuster selon le nombre d'écritures restantes
+            for i in range(0, len(new_matches), batch_size):
+                batch = new_matches[i:i + batch_size]
+                matches_worksheet.append_rows(batch)
+                write_count += 1
+                logging.info(f'Added {len(batch)} new friendly matches')
+                if write_count % 60 == 0:  # Limite de 60 écritures par minute
+                    logging.info("Approaching write limit, waiting 60 seconds...")
                     time.sleep(60)
 
-        if not new_matches_added and not rows_to_delete:
+        if not new_matches and not rows_to_delete:
             logging.info("No new matches added and no old entries deleted.")
 
     except Exception as e:
@@ -184,4 +198,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
