@@ -7,4 +7,5 @@ flask
 python-dotenv
 requests
 aiohttp
+gspread
 gspread_asyncio
