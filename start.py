@@ -1,3 +1,44 @@
+import os
+import logging
+import threading
+import time
+import asyncio
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+import gspread
+from google.oauth2 import service_account
+import requests  # Conservé pour les appels à l'API Brawl Stars
+
+# Load environment variables
+load_dotenv()
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Log initial
+print("Starting start.py - Debug check")
+logging.info("Starting start.py script")
+
+# Configuration pour Google Sheets
+CREDENTIALS_FILE = 'credentials.json'
+SHEET_ID = os.getenv('G')
+scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+
+# Initialisation différée de Google Sheets
+def init_sheets():
+    try:
+        creds = service_account.Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+        gs_client = gspread.authorize(creds)
+        sheet = gs_client.open_by_key(SHEET_ID)
+        players_worksheet = sheet.worksheet('Players')
+        matches_worksheet = sheet.worksheet('Matches')
+        logging.info("Successfully initialized Google Sheets client.")
+        return players_worksheet, matches_worksheet
+    except Exception as e:
+        logging.error(f"Failed to initialize Google Sheets: {e}")
+        raise
+
+# Fonction de mise à jour
 def update_sheet():
     players_worksheet, matches_worksheet = init_sheets()
     try:
@@ -6,7 +47,7 @@ def update_sheet():
         current_time = datetime.utcnow()
         thirty_days_ago = current_time - timedelta(days=30)
 
-        # Identifier les lignes à conserver (moins de 30 jours) and à supprimer
+        # Identifier les lignes à conserver (moins de 30 jours) et à supprimer
         valid_matches = []
         rows_to_delete = []
         for i, match in enumerate(all_matches, start=2):  # Commence à 2 pour ignorer l'en-tête
@@ -66,8 +107,8 @@ def update_sheet():
                                 if p['tag'] == player:
                                     brawler_name = p['brawler']['name'].upper()
                                     break
-                                if brawler_name:
-                                    break
+                            if brawler_name:
+                                break
                     elif 'players' in battle_data:
                         for p in battle_data['players']:
                             if p['tag'] == player:
@@ -139,7 +180,7 @@ def main():
     
     # Laisser les threads tourner en arrière-plan
     while True:
-        time.sleep(30)  # Boucle principale pour garder le script actif
+        time.sleep(60)  # Boucle principale pour garder le script actif
 
 if __name__ == "__main__":
     main()
