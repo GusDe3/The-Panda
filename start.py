@@ -152,7 +152,7 @@ def run_data_update():
     last_run = 0
     while True:
         current_time = time.time()
-        if current_time - last_run >= 3600:
+        if current_time - last_run >= 1800:
             logging.info("Starting data update cycle...")
             update_sheet()
             last_run = current_time
@@ -182,3 +182,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
