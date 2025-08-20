@@ -2,7 +2,8 @@ import os
 import logging
 import threading
 import time
-import asyncio  # Import explicite pour éviter tout doute
+import asyncio
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import gspread
 from google.oauth2 import service_account
@@ -41,12 +42,44 @@ def init_sheets():
 def update_sheet():
     players_worksheet, matches_worksheet = init_sheets()
     try:
+        # Récupérer toutes les lignes existantes
+        all_matches = matches_worksheet.get_all_records()
+        current_time = datetime.utcnow()
+        thirty_days_ago = current_time - timedelta(days=30)
+
+        # Identifier les lignes à conserver (moins de 30 jours) et à supprimer
+        valid_matches = []
+        rows_to_delete = []
+        for i, match in enumerate(all_matches, start=2):  # Commence à 2 pour ignorer l'en-tête
+            battle_time = datetime.strptime(match['battleTime'], '%Y%m%dT%H%M%S.000Z')
+            if battle_time >= thirty_days_ago:
+                valid_matches.append([match['PlayerTag'], match['battleTime'], match['event_mode'], match['event_map'], match['brawler_name'], match['result'], match['trophy_change']])
+            else:
+                rows_to_delete.append(i)
+
+        # Supprimer les anciennes lignes
+        if rows_to_delete:
+            logging.info(f"Deleting {len(rows_to_delete)} old entries...")
+            for row in sorted(rows_to_delete, reverse=True):
+                matches_worksheet.delete_row(row)
+            logging.info(f"Deleted old entries successfully.")
+
+        # Réécrire les matchs valides pour combler les vides
+        if valid_matches:
+            matches_worksheet.clear()  # Vider la feuille
+            matches_worksheet.append_row(['PlayerTag', 'battleTime', 'event_mode', 'event_map', 'brawler_name', 'result', 'trophy_change'])  # Réinsérer l'en-tête
+            for match in valid_matches:
+                matches_worksheet.append_row(match)
+            logging.info(f"Reorganized {len(valid_matches)} valid entries.")
+
+        # Ajouter les nouveaux matchs
         players = [row[0] for row in players_worksheet.get_all_values()[1:] if row[0].strip()]
         logging.info(f"Found {len(players)} valid players to process: {players}")
         existing_matches = matches_worksheet.get_all_records()
         BS_TOKEN = os.getenv('B')
         headers = {'Authorization': f'Bearer {BS_TOKEN}'}
 
+        new_matches_added = False
         for player in players:
             tag = player.strip().lstrip('#').upper()
             url = f'https://api.brawlstars.com/v1/players/%23{tag}/battlelog'
@@ -91,6 +124,7 @@ def update_sheet():
                     row = [player, battle_time, event_mode, event_map, brawler_name, result, str(trophy_change)]
                     matches_worksheet.append_row(row)
                     logging.info(f'Added new friendly match for {player} at {battle_time}')
+                    new_matches_added = True
                     time.sleep(1)  # Pause pour respecter la limite de 60 écritures/minute
             except requests.exceptions.RequestException as e:
                 logging.error(f"HTTP error for {player}: {e}")
@@ -99,6 +133,10 @@ def update_sheet():
                 if '429' in str(e):
                     logging.warning("Quota limit reached, waiting 60 seconds...")
                     time.sleep(60)
+
+        if not new_matches_added and not rows_to_delete:
+            logging.info("No new matches added and no old entries deleted.")
+
     except Exception as e:
         logging.error(f"Error in update_sheet: {e}")
     finally:
@@ -142,8 +180,7 @@ def main():
     
     # Laisser les threads tourner en arrière-plan
     while True:
-        time.sleep(30)  # Boucle principale pour garder le script actif
+        time.sleep(60)  # Boucle principale pour garder le script actif
 
 if __name__ == "__main__":
     main()
-
