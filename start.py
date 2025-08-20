@@ -43,39 +43,101 @@ def update_sheet():
         valid_matches = []
         rows_to_delete = []
         write_count = 0
-        for i, match in enumerate(all_matches, start=2):
-            # Correction: Ajouter le fuseau horaire UTC à la date parsée
-            battle_time = datetime.strptime(match['BattleTime'], '%Y%m%dT%H%M%S.000Z').replace(tzinfo=UTC)
-            logging.info(f"Checking BattleTime: {match['BattleTime']} (parsed: {battle_time})")
-            if battle_time < thirty_days_ago:
-                rows_to_delete.append(i)
-                logging.info(f"Marked for deletion: {match['BattleTime']}")
-            else:
-                valid_matches.append([match['PlayerTag'], match['BattleTime'], match['EventMode'], match['EventMap'], match['BrawlerName'], match['Result'], match['Trophy Change']])
-                logging.info(f"Kept: {match['BattleTime']}")
+        
+        # Vérifier que nous avons des données à traiter
+        if not all_matches:
+            logging.info("No matches found in the sheet.")
+        else:
+            for i, match in enumerate(all_matches, start=2):
+                try:
+                    # Vérifier que la clé 'BattleTime' existe
+                    if 'BattleTime' not in match:
+                        logging.warning(f"BattleTime key missing in row {i}, skipping")
+                        continue
+                        
+                    battle_time_str = match['BattleTime']
+                    
+                    # Parser la date avec différents formats possibles
+                    try:
+                        # Essayer le format avec millisecondes
+                        battle_time = datetime.strptime(battle_time_str, '%Y%m%dT%H%M%S.%fZ').replace(tzinfo=UTC)
+                    except ValueError:
+                        try:
+                            # Essayer le format sans millisecondes
+                            battle_time = datetime.strptime(battle_time_str, '%Y%m%dT%H%M%SZ').replace(tzinfo=UTC)
+                        except ValueError:
+                            logging.error(f"Could not parse BattleTime: {battle_time_str}")
+                            continue
+                    
+                    logging.info(f"Checking BattleTime: {battle_time_str} (parsed: {battle_time})")
+                    
+                    # DEBUG: Log pour vérifier la comparaison
+                    logging.info(f"Comparing: {battle_time} < {thirty_days_ago} = {battle_time < thirty_days_ago}")
+                    
+                    # Vérifier que la date est valide avant de comparer
+                    if battle_time.date() > current_time.date():
+                        logging.warning(f"BattleTime {battle_time} is in the future, keeping it")
+                        valid_matches.append([
+                            match.get('PlayerTag', ''),
+                            match.get('BattleTime', ''),
+                            match.get('EventMode', ''),
+                            match.get('EventMap', ''),
+                            match.get('BrawlerName', ''),
+                            match.get('Result', ''),
+                            match.get('Trophy Change', '')
+                        ])
+                    elif battle_time < thirty_days_ago:
+                        rows_to_delete.append(i)
+                        logging.info(f"Marked for deletion: {battle_time_str}")
+                    else:
+                        valid_matches.append([
+                            match.get('PlayerTag', ''),
+                            match.get('BattleTime', ''),
+                            match.get('EventMode', ''),
+                            match.get('EventMap', ''),
+                            match.get('BrawlerName', ''),
+                            match.get('Result', ''),
+                            match.get('Trophy Change', '')
+                        ])
+                        logging.info(f"Kept: {battle_time_str}")
 
+                except Exception as e:
+                    logging.error(f"Error processing row {i}: {e}")
+                    continue
+
+        # Désactiver temporairement la suppression pour debugger
         if rows_to_delete:
-            logging.info(f"Deleting {len(rows_to_delete)} old entries...")
-            for row in sorted(rows_to_delete, reverse=True):
-                matches_worksheet.delete_rows(row, row)
-                write_count += 1
-                if write_count % 60 == 0:
-                    logging.info("Approaching write limit, waiting 60 seconds...")
-                    time.sleep(60)
-            logging.info(f"Deleted old entries successfully.")
+            logging.info(f"WOULD DELETE {len(rows_to_delete)} old entries (disabled for debugging): {rows_to_delete}")
+            # Ne pas supprimer pour l'instant - commenter cette partie
+            # for row in sorted(rows_to_delete, reverse=True):
+            #     matches_worksheet.delete_rows(row, row)
+            #     write_count += 1
+            #     if write_count % 60 == 0:
+            #         logging.info("Approaching write limit, waiting 60 seconds...")
+            #         time.sleep(60)
+            # logging.info(f"Deleted old entries successfully.")
+        else:
+            logging.info("No old entries to delete.")
 
+        # Réorganiser les entrées valides
         if valid_matches:
-            matches_worksheet.clear()
-            write_count += 1
-            matches_worksheet.append_row(['PlayerTag', 'BattleTime', 'EventMode', 'EventMap', 'BrawlerName', 'Result', 'Trophy Change'])
-            write_count += 1
-            if valid_matches:
-                matches_worksheet.update('A2', valid_matches)
+            try:
+                matches_worksheet.clear()
                 write_count += 1
-            logging.info(f"Reorganized {len(valid_matches)} valid entries.")
+                matches_worksheet.append_row(['PlayerTag', 'BattleTime', 'EventMode', 'EventMap', 'BrawlerName', 'Result', 'Trophy Change'])
+                write_count += 1
+                if valid_matches:
+                    matches_worksheet.update('A2', valid_matches)
+                    write_count += 1
+                logging.info(f"Reorganized {len(valid_matches)} valid entries.")
+            except Exception as e:
+                logging.error(f"Error updating sheet with valid matches: {e}")
 
-        players = [row[0] for row in players_worksheet.get_all_values()[1:] if row[0].strip()]
+        # Récupérer les nouveaux matchs des joueurs
+        players = [row[0] for row in players_worksheet.get_all_values()[1:] if row and row[0].strip()]
         logging.info(f"Found {len(players)} valid players to process: {players}")
+        
+        # Recharger les matchs existants après les modifications
         existing_matches = matches_worksheet.get_all_records()
         BS_TOKEN = os.getenv('B')
         headers = {'Authorization': f'Bearer {BS_TOKEN}'}
@@ -93,15 +155,19 @@ def update_sheet():
 
                 for battle in battles:
                     battle_time = battle['battleTime']
-                    if any(m['PlayerTag'] == player and m['BattleTime'] == battle_time for m in existing_matches):
+                    # Vérifier si le match existe déjà
+                    if any(m.get('PlayerTag') == player and m.get('BattleTime') == battle_time for m in existing_matches):
                         continue
+                    
                     event = battle['event']
                     event_mode = event.get('mode', '')
                     event_map = event.get('map', None)
                     if event_map is None:
                         continue
+                    
                     battle_data = battle['battle']
                     brawler_name = None
+                    
                     if 'teams' in battle_data:
                         for team in battle_data['teams']:
                             for p in team:
@@ -115,13 +181,18 @@ def update_sheet():
                             if p['tag'] == player:
                                 brawler_name = p['brawler']['name'].upper()
                                 break
+                    
                     if not brawler_name:
                         continue
+                    
                     result = battle_data.get('result', '')
                     trophy_change = battle.get('trophyChange', 0)
+                    
+                    # Ne traiter que les matchs amicaux (sans changement de trophées)
                     if trophy_change != 0:
                         logging.info(f"Skipped non-friendly match for {player} at {battle_time} (trophyChange = {trophy_change})")
                         continue
+                    
                     new_matches.append([player, battle_time, event_mode, event_map, brawler_name, result, str(trophy_change)])
 
             except Exception as e:
@@ -132,12 +203,15 @@ def update_sheet():
             batch_size = 50
             for i in range(0, len(new_matches), batch_size):
                 batch = new_matches[i:i + batch_size]
-                matches_worksheet.append_rows(batch)
-                write_count += 1
-                logging.info(f'Added {len(batch)} new friendly matches')
-                if write_count % 60 == 0:
-                    logging.info("Approaching write limit, waiting 60 seconds...")
-                    time.sleep(60)
+                try:
+                    matches_worksheet.append_rows(batch)
+                    write_count += 1
+                    logging.info(f'Added {len(batch)} new friendly matches')
+                    if write_count % 60 == 0:
+                        logging.info("Approaching write limit, waiting 60 seconds...")
+                        time.sleep(60)
+                except Exception as e:
+                    logging.error(f"Error appending batch: {e}")
 
         if not new_matches and not rows_to_delete:
             logging.info("No new matches added and no old entries deleted.")
@@ -152,7 +226,7 @@ def run_data_update():
     last_run = 0
     while True:
         current_time = time.time()
-        if current_time - last_run >= 1800:
+        if current_time - last_run >= 3600:
             logging.info("Starting data update cycle...")
             update_sheet()
             last_run = current_time
@@ -182,4 +256,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
