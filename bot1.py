@@ -195,11 +195,11 @@ async def command_compare(ctx, id1: str, id2: str, id3: str, *, map_name: str):
         brawler_stats = Counter(m['BrawlerName'].upper() for m in valid_matches)  # Uniformiser en majuscules
         brawler_wins = Counter(m['BrawlerName'].upper() for m in valid_matches if m['Result'].lower() == 'victory')
         
-        top_15 = brawler_stats.most_common(15)
-        embed = discord.Embed(title=f"Top 15 Brawlers on {map_name}", color=discord.Color.from_rgb(255, 69, 0))
+        top_20 = brawler_stats.most_common(20)
+        embed = discord.Embed(title=f"Top 20 Brawlers on {map_name}", color=discord.Color.from_rgb(255, 69, 0))
         embed.set_footer(text=f"Requested by {ctx.author.name} at {datetime.datetime.now().strftime('%H:%M:%S %d/%m/%Y')}")
         
-        for i, (brawler, total) in enumerate(top_15, 1):
+        for i, (brawler, total) in enumerate(top_20, 1):
             wins = brawler_wins.get(brawler, 0)
             winrate = (wins / total * 100) if total > 0 else 0
             embed.add_field(name=f"{i}. {brawler}", value=f"Used {total} times | Winrate: {winrate:.1f}% ({wins} wins)", inline=False)
@@ -254,4 +254,5 @@ async def command_counters(ctx, id1: str, id2: str, id3: str):
 # Exporter bot pour être utilisé par start.py
 keep_alive()
 bot  # Assure que bot est disponible à l'importation
+
 
