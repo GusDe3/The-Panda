@@ -10,25 +10,36 @@ from dateutil.parser import parse
 from collections import Counter
 import logging
 from keep_alive import keep_alive
+import requests  # Ajouté pour la session proxy
 
 load_dotenv()
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Replace with your actual values
 DISCORD_TOKEN = os.getenv('D')  # Remplacez par votre token Discord
-SHEET_ID = os.getenv('G')       # Remplacez par l'ID de votre Google Sheet
+SHEET_ID = os.getenv('G')  # Remplacez par l'ID de votre Google Sheet
 CREDENTIALS_FILE = 'credentials.json'  # Chemin vers votre fichier de credentials
 YOUR_CHANNEL_ID = 1403782456108388404  # Remplacez par l'ID du canal obtenu avec Mode développeur
 
 # Configurable prefix set to '/'
 BOT_PREFIX = '/'
 
-
-# Set up Google Sheets client
+# Set up Google Sheets client avec proxy
 scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 creds = service_account.Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-gs_client = gspread.authorize(creds)
+
+# Configure le proxy (remplace par ton proxy statique unique, ex. 'http://user:pass@ip:port' si auth requis)
+session = requests.Session()
+session.proxies.update({
+    'http': 'http://your_proxy_ip:port',  # Ex. 'http://123.45.67.89:8080'
+    'https': 'http://your_proxy_ip:port'  # Même pour HTTPS
+})
+
+# Utilise la session avec proxy pour gspread
+gs_client = gspread.Client(auth=creds, session=session)
+
 sheet = gs_client.open_by_key(SHEET_ID)
 players_worksheet = sheet.worksheet('Players')  # Column A has player tags like #ABC123
 matches_worksheet = sheet.worksheet('Matches')  # Headers: PlayerTag, BattleTime, EventMode, EventMap, BrawlerName, Result, TrophyChange
@@ -52,6 +63,8 @@ async def on_ready():
 # Log all messages and handle errors
 @bot.event
 async def on_message(message):
+    if message.author == bot.user:
+        return
     if message.author == bot.user:
         return
     logging.info(f"Message received: {message.content} from {message.author.name} in channel {message.channel.id}")
@@ -79,10 +92,10 @@ async def command_compare(ctx, id1: str, id2: str, id3: str, *, map_name: str):
         thirty_days_ago = datetime.datetime.now(datetime.timezone.utc) - timedelta(days=30)
         
         logging.info(f"Filtering matches for {ids} on {map_name}: Raw data count = {len(matches)}")
-        filtered = [m for m in matches if m['PlayerTag'].upper() in ids 
-                   and m['EventMap'].lower() == map_name.lower() 
-                   and parse(m['BattleTime']) > thirty_days_ago 
-                   and m.get('EventMode', '').lower() not in ['solo showdown', 'duo showdown']]
+        filtered = [m for m in matches if m['PlayerTag'].upper() in ids
+                    and m['EventMap'].lower() == map_name.lower()
+                    and parse(m['BattleTime']) > thirty_days_ago
+                    and m.get('EventMode', '').lower() not in ['solo showdown', 'duo showdown']]
         logging.info(f"Filtered matches count: {len(filtered)}")
         if not filtered:
             await ctx.send('No matches found for these players on this map in the last 30 days (excluding Showdown).')
@@ -114,7 +127,6 @@ async def command_compare(ctx, id1: str, id2: str, id3: str, *, map_name: str):
     except Exception as e:
         logging.error(f"Error in /compare: {e}")
         await ctx.send("Une erreur s'est produite dans la commande.")
-
 
 # Exporter bot pour être utilisé par start.py
 keep_alive()
