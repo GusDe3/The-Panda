@@ -10,7 +10,7 @@ from dateutil.parser import parse
 from collections import Counter
 import logging
 from keep_alive import keep_alive
-import requests  # Ajouté pour la session proxy
+# import aiohttp  # Uncomment if adding Brawl API
 
 load_dotenv()
 
@@ -18,35 +18,23 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Replace with your actual values
-DISCORD_TOKEN = os.getenv('D')  # Remplacez par votre token Discord
-SHEET_ID = os.getenv('G')  # Remplacez par l'ID de votre Google Sheet
-CREDENTIALS_FILE = 'credentials.json'  # Chemin vers votre fichier de credentials
-YOUR_CHANNEL_ID = 1403782456108388404  # Remplacez par l'ID du canal obtenu avec Mode développeur
+DISCORD_TOKEN = os.getenv('D') # Remplacez par votre token Discord
+SHEET_ID = os.getenv('G') # Remplacez par l'ID de votre Google Sheet
+CREDENTIALS_FILE = 'credentials.json' # Chemin vers votre fichier de credentials
+YOUR_CHANNEL_ID = 1403782456108388404 # Remplacez par l'ID du canal obtenu avec Mode développeur
+# BOT_PREFIX = "/"  # Configurable prefix set to '/'
 
-# Configurable prefix set to '/'
-BOT_PREFIX = '/'
-
-# Set up Google Sheets client avec proxy
+# Set up Google Sheets client
 scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 creds = service_account.Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-
-# Configure le proxy (remplace par ton proxy statique unique, ex. 'http://user:pass@ip:port' si auth requis)
-session = requests.Session()
-session.proxies.update({
-    'http': 'http://your_proxy_ip:port',  # Ex. 'http://123.45.67.89:8080'
-    'https': 'http://your_proxy_ip:port'  # Même pour HTTPS
-})
-
-# Utilise la session avec proxy pour gspread
-gs_client = gspread.Client(auth=creds, session=session)
-
+gs_client = gspread.authorize(creds)
 sheet = gs_client.open_by_key(SHEET_ID)
-players_worksheet = sheet.worksheet('Players')  # Column A has player tags like #ABC123
-matches_worksheet = sheet.worksheet('Matches')  # Headers: PlayerTag, BattleTime, EventMode, EventMap, BrawlerName, Result, TrophyChange
+players_worksheet = sheet.worksheet('Players') # Column A has player tags like #ABC123
+matches_worksheet = sheet.worksheet('Matches') # Headers: PlayerTag, BattleTime, EventMode, EventMap, BrawlerName, Result, TrophyChange
 
 # Discord bot setup with intents
 intents = discord.Intents.default()
-intents.message_content = True  # Ensure message content intent is enabled
+intents.message_content = True # Ensure message content intent is enabled
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 
 # Log startup details
@@ -63,8 +51,6 @@ async def on_ready():
 # Log all messages and handle errors
 @bot.event
 async def on_message(message):
-    if message.author == bot.user:
-        return
     if message.author == bot.user:
         return
     logging.info(f"Message received: {message.content} from {message.author.name} in channel {message.channel.id}")
@@ -111,7 +97,7 @@ async def command_compare(ctx, id1: str, id2: str, id3: str, *, map_name: str):
             await ctx.send("No valid matches found with required data (BrawlerName and Result as 'victory' or 'defeat').")
             return
         
-        brawler_stats = Counter(m['BrawlerName'].upper() for m in valid_matches)  # Uniformiser en majuscules
+        brawler_stats = Counter(m['BrawlerName'].upper() for m in valid_matches) # Uniformiser en majuscules
         brawler_wins = Counter(m['BrawlerName'].upper() for m in valid_matches if m['Result'].lower() == 'victory')
         
         top_20 = brawler_stats.most_common(20)
@@ -131,6 +117,3 @@ async def command_compare(ctx, id1: str, id2: str, id3: str, *, map_name: str):
 # Exporter bot pour être utilisé par start.py
 keep_alive()
 bot  # Assure que bot est disponible à l'importation
-
-
-
