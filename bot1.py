@@ -22,7 +22,7 @@ DISCORD_TOKEN = os.getenv('D') # Remplacez par votre token Discord
 SHEET_ID = os.getenv('G') # Remplacez par l'ID de votre Google Sheet
 CREDENTIALS_FILE = 'credentials.json' # Chemin vers votre fichier de credentials
 YOUR_CHANNEL_ID = 1403782456108388404 # Remplacez par l'ID du canal obtenu avec Mode développeur
-# BOT_PREFIX = "/"  # Configurable prefix set to '/'
+BOT_PREFIX = "/"  # Configurable prefix set to '/'
 
 # Set up Google Sheets client
 scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
@@ -75,3 +75,4 @@ async def command_counters(ctx, id1: str, id2: str, id3: str):
 # Exporter bot pour être utilisé par start.py
 keep_alive()
 bot  # Assure que bot est disponible à l'importation
+
