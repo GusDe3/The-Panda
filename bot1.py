@@ -163,6 +163,37 @@ async def command_counters(ctx, id1: str, id2: str, id3: str):
         logging.error(f"Error in /counters: {e}")
         await ctx.send("Une erreur s'est produite dans la commande.")
 
+@bot.command(name='main')
+async def command_main(ctx, *, map_name: str):
+    logging.info(f"Command /main received from {ctx.author.name} with map_name: {map_name}")
+    try:
+        matches = matches_worksheet.get_all_records()
+        fifteen_days_ago = datetime.datetime.now(datetime.timezone.utc) - timedelta(days=15)
+        
+        logging.info(f"Filtering matches on {map_name} for the last 15 days: Raw data count = {len(matches)}")
+        filtered = [m for m in matches if m.get('EventMap', '').lower() == map_name.lower() 
+                   and parse(m['BattleTime']) > fifteen_days_ago 
+                   and m.get('EventMode', '').lower() not in ['solo showdown', 'duo showdown']]
+        logging.info(f"Filtered matches count: {len(filtered)}")
+        if not filtered:
+            await ctx.send(f'No matches found for this map in the last 15 days (excluding Showdown).')
+            return
+        
+        # Compter les brawlers les plus joués
+        brawler_count = Counter(m['BrawlerName'].upper() for m in filtered if m.get('BrawlerName'))
+        top_15 = brawler_count.most_common(15)
+        
+        embed = discord.Embed(title=f"Top 15 Brawlers on {map_name} (last 15 days)", color=discord.Color.from_rgb(255, 69, 0))
+        embed.set_footer(text=f"Requested by {ctx.author.name} at {datetime.datetime.now().strftime('%H:%M:%S %d/%m/%Y')}")
+        
+        for i, (brawler, count) in enumerate(top_15, 1):
+            embed.add_field(name=f"{i}. {brawler}", value=f"Used {count} times", inline=False)
+        
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logging.error(f"Error in /main: {e}")
+        await ctx.send("Une erreur s'est produite dans la commande.")
+
 # Exporter bot pour être utilisé par start.py
 keep_alive()
 bot.run(DISCORD_TOKEN)  # Ajouté pour lancer le bot
