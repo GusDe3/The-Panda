@@ -190,7 +190,7 @@ async def command_debug(ctx):
 # Syntaxe :
 #   !draft <id1> <id2> <id3> <map> | ban: COLT, PIPER | enemy: SHELLY, BULL | ally: SPIKE
 # Tout ce qui suit la map est optionnel.
-DRAFT_DAYS = 60          # fenetre d'historique
+DRAFT_DAYS = 30          # fenetre d'historique
 DRAFT_MIN_GAMES = 3      # nb de games mini pour conseiller un brawler
 W_MAP = 0.65             # poids du winrate sur la map
 W_SYN = 0.35             # poids de la synergie avec les allies deja pick
