@@ -4,7 +4,7 @@ import time
 import requests
 from dotenv import load_dotenv
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import gspread
 from google.oauth2 import service_account
 import datetime
@@ -342,6 +342,35 @@ def scrape_once():
     return len(new_rows), skipped, dict(types)
 
 
+# --- Rafraichissement automatique -------------------------------------------
+AUTO_UPDATE_MINUTES = 15   # intervalle du scraping auto (baisse a 10 si grosses sessions)
+_scrape_in_progress = False
+
+async def do_scrape():
+    """Lance scrape_once en evitant les executions simultanees.
+       Retourne (added, skipped, types) ou None si un scrape est deja en cours."""
+    global _scrape_in_progress
+    if _scrape_in_progress:
+        return None
+    _scrape_in_progress = True
+    try:
+        return await bot.loop.run_in_executor(None, scrape_once)
+    finally:
+        _scrape_in_progress = False
+
+@tasks.loop(minutes=AUTO_UPDATE_MINUTES)
+async def auto_update():
+    result = await do_scrape()
+    if result is None:
+        return
+    added, skipped, types = result
+    logging.info(f"Auto-update: {added} ajoutees, {skipped} ladder ignorees, types={types}")
+
+@auto_update.before_loop
+async def before_auto_update():
+    await bot.wait_until_ready()
+
+
 # ===========================================================================
 #  EVENTS
 # ===========================================================================
@@ -349,11 +378,15 @@ def scrape_once():
 async def on_ready():
     logging.info(f'Logged in as {bot.user} (ID: {bot.user.id})')
     logging.info(f'ML disponible: {SKLEARN_AVAILABLE}')
+    if not auto_update.is_running():
+        auto_update.start()
+        logging.info(f"Rafraichissement automatique active (toutes les {AUTO_UPDATE_MINUTES} min).")
     channel = bot.get_channel(YOUR_CHANNEL_ID)
     if channel:
         await channel.send(
-            f"Bot online ! Commandes : {BOT_PREFIX}compare, {BOT_PREFIX}main, "
-            f"{BOT_PREFIX}draft, {BOT_PREFIX}debug, {BOT_PREFIX}inspect, {BOT_PREFIX}update"
+            f"Bot online ! Maj auto toutes les {AUTO_UPDATE_MINUTES} min. "
+            f"Commandes : {BOT_PREFIX}compare, {BOT_PREFIX}main, {BOT_PREFIX}draft, "
+            f"{BOT_PREFIX}debug, {BOT_PREFIX}inspect, {BOT_PREFIX}update, {BOT_PREFIX}reset"
         )
 
 @bot.event
@@ -461,7 +494,11 @@ async def command_update(ctx):
     logging.info(f"Command {BOT_PREFIX}update from {ctx.author.name}")
     await ctx.send("Mise a jour des donnees en cours... (ca peut prendre une minute)")
     try:
-        added, skipped, types = await bot.loop.run_in_executor(None, scrape_once)
+        result = await do_scrape()
+        if result is None:
+            await ctx.send("Une mise a jour est deja en cours, reessaie dans un instant.")
+            return
+        added, skipped, types = result
         msg = f"Termine : **{added}** nouvelles parties ajoutees, **{skipped}** parties ladder ignorees."
         if types:
             msg += "\nTypes ajoutes : " + ", ".join(f"{k}: {v}" for k, v in types.items())
@@ -493,21 +530,15 @@ async def command_reset(ctx, confirm: str = None):
 
 
 # ===========================================================================
-#  ASSISTANT DE DRAFT (avec module ML)
+#  COMMANDE DRAFT  ->  top 15 des brawlers les plus joues par le trio sur une map
 # ===========================================================================
-# Syntaxe :
-#   !draft <id1> <id2> <id3> <map> | ban: COLT, PIPER | enemy: SHELLY, BULL | ally: SPIKE
 DRAFT_DAYS = 60
 
 @bot.command(name='draft')
-async def command_draft(ctx, id1: str, id2: str, id3: str, *, rest: str = ""):
-    logging.info(f"Command {BOT_PREFIX}draft from {ctx.author.name}: {id1} {id2} {id3} | {rest}")
+async def command_draft(ctx, id1: str, id2: str, id3: str, *, map_name: str):
+    logging.info(f"Command {BOT_PREFIX}draft from {ctx.author.name}: {id1} {id2} {id3} | {map_name}")
     try:
         ids = {normalize_tag(id1), normalize_tag(id2), normalize_tag(id3)}
-        map_name, bans, enemies, allies = parse_draft_args(rest)
-        if not map_name:
-            await ctx.send("Syntaxe : `!draft <id1> <id2> <id3> <map> | ban: COLT | enemy: SHELLY | ally: SPIKE`")
-            return
 
         team_matches = get_team_matches(ids, map_name=map_name, days=DRAFT_DAYS)
         if not team_matches:
@@ -515,7 +546,6 @@ async def command_draft(ctx, id1: str, id2: str, id3: str, *, rest: str = ""):
                            f"Verifie avec `!debug` (nb de lignes) ou `!main {map_name}`.")
             return
 
-        # --- Stats descriptives : top 15 joues + winrate ---
         games, wins = Counter(), Counter()
         for m in team_matches:
             b = m.get('BrawlerName', '').upper()
@@ -527,41 +557,11 @@ async def command_draft(ctx, id1: str, id2: str, id3: str, *, rest: str = ""):
                 wins[b] += 1
         top15 = games.most_common(15)
 
-        # --- Entrainement du modele ---
-        battles = build_battles(team_matches)
-        samples = battles_to_samples(battles)
-        all_brawlers = sorted({b for s, _ in samples for b in s})
-        model_info = train_model(samples, all_brawlers)
-        mode = "modele ML" if model_info else "winrate (donnees insuffisantes pour le ML)"
-
-        taken = {x.upper() for x in (bans + enemies + allies)}
-
-        # --- Suggestions ML ---
-        picks = suggest_picks(model_info, battles, all_brawlers, allies, taken, games, wins, n=5)
-        pick_names = {b for _, b, _ in picks}
-        ban_sugg = suggest_bans(model_info, all_brawlers, taken | pick_names, games, wins, n=5)
-
-        # --- Construction de l'embed ---
-        ctx_bits = []
-        if bans: ctx_bits.append(f"bans: {', '.join(bans)}")
-        if enemies: ctx_bits.append(f"ennemis: {', '.join(enemies)}")
-        if allies: ctx_bits.append(f"allies: {', '.join(allies)}")
-        subtitle = " | ".join(ctx_bits) if ctx_bits else "aucun pick/ban renseigne"
-
-        embed = discord.Embed(title=f"Draft - {map_name}", description=subtitle,
+        embed = discord.Embed(title=f"Top 15 brawlers - {map_name}",
                               color=discord.Color.from_rgb(255, 69, 0))
-
         top_lines = [f"{i}. {b} — {tot}g ({(wins[b]/tot*100):.0f}%)" for i, (b, tot) in enumerate(top15, 1)]
-        embed.add_field(name="Top 15 brawlers joues", value="\n".join(top_lines) or "—", inline=False)
-
-        ban_lines = [f"{i}. {b} — force {f*100:.0f} ({g}g)" for i, (f, b, g) in enumerate(ban_sugg, 1)]
-        embed.add_field(name=f"Bans conseilles ({mode})", value="\n".join(ban_lines) or "—", inline=False)
-
-        pick_lines = [f"{i}. {b} — score {s*100:.0f} ({g}g)" for i, (s, b, g) in enumerate(picks, 1)]
-        embed.add_field(name=f"Picks conseilles ({mode})", value="\n".join(pick_lines) or "—", inline=False)
-
-        embed.set_footer(text=f"{len(team_matches)} parties / {len(samples)} comps (Ranked/tournoi, {DRAFT_DAYS}j). "
-                              f"force = P(victoire) du brawler seul ; score = pick + synergie.")
+        embed.add_field(name=f"Trio sur {DRAFT_DAYS} jours", value="\n".join(top_lines) or "—", inline=False)
+        embed.set_footer(text=f"Base sur {len(team_matches)} parties (Ranked/tournoi). Demande par {ctx.author.name}")
         await ctx.send(embed=embed)
     except Exception as e:
         logging.error(f"Error in draft: {e}")
