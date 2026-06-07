@@ -1,5 +1,6 @@
 import os
 import math
+import requests
 from dotenv import load_dotenv
 import discord
 from discord.ext import commands
@@ -11,7 +12,7 @@ from dateutil.parser import parse
 from collections import Counter, defaultdict
 import logging
 from keep_alive import keep_alive
- 
+
 # --- ML (optionnel) : si scikit-learn manque, on retombe sur le winrate -----
 try:
     from sklearn.linear_model import LogisticRegression
@@ -19,19 +20,20 @@ try:
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
- 
+
 load_dotenv()
- 
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
- 
+
 DISCORD_TOKEN = os.getenv('D')
 SHEET_ID = os.getenv('G')
+BS_TOKEN = os.getenv('B')  # token Brawl Stars (pour la commande !inspect)
 CREDENTIALS_FILE = 'credentials.json'
 YOUR_CHANNEL_ID = 1403782456108388404
- 
+
 BOT_PREFIX = '!'
- 
+
 # Set up Google Sheets client
 scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 creds = service_account.Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
@@ -39,23 +41,23 @@ gs_client = gspread.authorize(creds)
 sheet = gs_client.open_by_key(SHEET_ID)
 players_worksheet = sheet.worksheet('Players')
 matches_worksheet = sheet.worksheet('Matches')  # PlayerTag, BattleTime, EventMode, EventMap, BrawlerName, Result, TrophyChange, BattleType
- 
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
- 
- 
+
+
 # ===========================================================================
 #  HELPERS GENERAUX
 # ===========================================================================
 def normalize_tag(t):
     """Uniformise un tag joueur en '#XXXX' majuscule (tolere espaces / # manquant)."""
     return '#' + str(t).strip().lstrip('#').upper()
- 
- 
+
+
 # /!\ Dans l'API Brawl Stars, "ranked" = LADDER. Le mode "Ranked" = soloRanked/teamRanked.
 LADDER_BATTLE_TYPES = {'ranked'}
- 
+
 def is_ladder_match(m):
     """True si la partie est du LADDER (a exclure)."""
     btype = str(m.get('BattleType', '')).strip().lower()
@@ -68,8 +70,8 @@ def is_ladder_match(m):
         return int(float(raw)) != 0
     except ValueError:
         return False
- 
- 
+
+
 def wilson_lower_bound(wins, total, z=1.96):
     """Borne basse de Wilson (95%) : winrate prudent qui penalise les petits echantillons."""
     if total <= 0:
@@ -79,8 +81,8 @@ def wilson_lower_bound(wins, total, z=1.96):
     centre = phat + z * z / (2 * total)
     marge = z * math.sqrt((phat * (1 - phat) + z * z / (4 * total)) / total)
     return max(0.0, (centre - marge) / denom)
- 
- 
+
+
 def get_team_matches(ids, map_name=None, days=30):
     """Matchs (non-ladder) d'un trio, eventuellement sur une map. `ids` = set de tags normalises."""
     matches = matches_worksheet.get_all_records()
@@ -102,8 +104,8 @@ def get_team_matches(ids, map_name=None, days=30):
             continue
         out.append(m)
     return out
- 
- 
+
+
 # ===========================================================================
 #  MODULE D'APPRENTISSAGE AUTOMATIQUE
 # ===========================================================================
@@ -115,7 +117,7 @@ MODEL_MIN_SAMPLES = 40   # nb de parties mini pour entrainer (sinon fallback win
 MODEL_C = 0.3            # regularisation L2 (petit = plus fort, anti-overfit)
 W_MODEL = 0.6            # poids du modele dans le score de pick
 W_SYNERGY = 0.4          # poids de la synergie observee dans le score de pick
- 
+
 def build_battles(team_matches):
     """Regroupe les lignes par BattleTime -> {tag: (brawler, result)} (coequipiers = meme heure)."""
     battles = defaultdict(dict)
@@ -126,7 +128,7 @@ def build_battles(team_matches):
         if b and r in ('victory', 'defeat'):
             battles[m['BattleTime']][tag] = (b, r)
     return battles
- 
+
 def battles_to_samples(battles):
     """Chaque partie -> (set de brawlers de notre cote, 1=win/0=loss)."""
     samples = []
@@ -136,7 +138,7 @@ def battles_to_samples(battles):
         if brawlers:
             samples.append((brawlers, 1 if res == 'victory' else 0))
     return samples
- 
+
 def comp_winrate(battles, required):
     """Winrate des parties ou tous les brawlers `required` etaient presents."""
     req = {x.upper() for x in required}
@@ -148,7 +150,7 @@ def comp_winrate(battles, required):
             if next(iter(players.values()))[1] == 'victory':
                 w += 1
     return w, g
- 
+
 def train_model(samples, all_brawlers):
     """Entraine la regression logistique. Retourne (model, idx) ou None si impossible."""
     if not SKLEARN_AVAILABLE or len(samples) < MODEL_MIN_SAMPLES or not all_brawlers:
@@ -169,7 +171,7 @@ def train_model(samples, all_brawlers):
         logging.error(f"train_model failed: {e}")
         return None
     return (model, idx)
- 
+
 def model_winprob(model_info, comp):
     """P(victoire) predite par le modele pour une comp (set de brawlers)."""
     model, idx = model_info
@@ -178,7 +180,7 @@ def model_winprob(model_info, comp):
         if b in idx:
             x[0, idx[b]] = 1.0
     return float(model.predict_proba(x)[0][1])
- 
+
 def suggest_bans(model_info, all_brawlers, taken, games, wins, n=5, min_games=3):
     """Bans = brawlers les plus FORTS sur la map (a refuser a l'adversaire)."""
     cands = [b for b in all_brawlers if b not in taken and games[b] >= min_games]
@@ -188,7 +190,7 @@ def suggest_bans(model_info, all_brawlers, taken, games, wins, n=5, min_games=3)
         scored.append((force, b, games[b]))
     scored.sort(key=lambda t: t[0], reverse=True)
     return scored[:n]
- 
+
 def suggest_picks(model_info, battles, all_brawlers, allies, taken, games, wins, n=5, min_games=2):
     """Picks = meilleurs completements de VOTRE comp (modele + synergie observee)."""
     ally_set = {a.upper() for a in allies}
@@ -209,8 +211,8 @@ def suggest_picks(model_info, battles, all_brawlers, allies, taken, games, wins,
         scored.append((score, b, syn_g))
     scored.sort(key=lambda t: t[0], reverse=True)
     return scored[:n]
- 
- 
+
+
 # ===========================================================================
 #  PARSING DRAFT
 # ===========================================================================
@@ -235,8 +237,8 @@ def parse_draft_args(raw):
         elif map_name is None:
             map_name = part
     return map_name, bans, enemies, allies
- 
- 
+
+
 # ===========================================================================
 #  EVENTS
 # ===========================================================================
@@ -248,22 +250,22 @@ async def on_ready():
     if channel:
         await channel.send(
             f"Bot online ! Commandes : {BOT_PREFIX}compare, {BOT_PREFIX}main, "
-            f"{BOT_PREFIX}draft, {BOT_PREFIX}debug"
+            f"{BOT_PREFIX}draft, {BOT_PREFIX}debug, {BOT_PREFIX}inspect"
         )
- 
+
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
     logging.info(f"Message: {message.content} from {message.author.name} in {message.channel.id}")
     await bot.process_commands(message)
- 
+
 @bot.event
 async def on_command_error(ctx, error):
     logging.error(f"Command error: {error}")
     await ctx.send(f"Error: {str(error)}")
- 
- 
+
+
 # ===========================================================================
 #  COMMANDE DEBUG
 # ===========================================================================
@@ -294,15 +296,67 @@ async def command_debug(ctx):
     except Exception as e:
         logging.error(f"Error in debug: {e}")
         await ctx.send("Une erreur s'est produite dans !debug.")
- 
- 
+
+
+# ===========================================================================
+#  COMMANDE INSPECT  ->  interroge l'API BS DEPUIS le serveur (bon token/IP)
+# ===========================================================================
+# Usage : !inspect            (teste le 1er joueur de la feuille Players)
+#         !inspect #ABC123     (teste un joueur precis)
+@bot.command(name='inspect')
+async def command_inspect(ctx, tag: str = None):
+    logging.info(f"Command {BOT_PREFIX}inspect from {ctx.author.name}: {tag}")
+    try:
+        if tag is None:
+            players = [r[0] for r in players_worksheet.get_all_values()[1:] if r and r[0].strip()]
+            if not players:
+                await ctx.send("Aucun joueur dans la feuille Players.")
+                return
+            tag = players[0]
+        clean = tag.strip().lstrip('#').upper()
+
+        url = f'https://api.brawlstars.com/v1/players/%23{clean}/battlelog'
+        r = requests.get(url, headers={'Authorization': f'Bearer {BS_TOKEN}'}, timeout=15)
+
+        embed = discord.Embed(title=f"Inspect API - #{clean}", color=discord.Color.blue())
+        embed.add_field(name="HTTP status", value=str(r.status_code), inline=False)
+
+        if r.status_code != 200:
+            embed.add_field(name="Reponse API", value=f"```{r.text[:600]}```", inline=False)
+            embed.set_footer(text="Status 403 = token verrouille sur une autre IP -> regenere le token pour l'IP du serveur.")
+            await ctx.send(embed=embed)
+            return
+
+        items = r.json().get('items', [])
+        embed.add_field(name="Batailles renvoyees", value=str(len(items)), inline=False)
+
+        types = Counter()
+        trophy = Counter()
+        for it in items:
+            b = it.get('battle', {})
+            types[str(b.get('type', '(AUCUN)'))] += 1
+            trophy['avec' if 'trophyChange' in b else 'sans'] += 1
+        embed.add_field(name="Types de battle", value=", ".join(f"{k}: {v}" for k, v in types.items()) or "—", inline=False)
+        embed.add_field(name="trophyChange present", value=", ".join(f"{k}: {v}" for k, v in trophy.items()) or "—", inline=False)
+
+        if items:
+            b0 = items[0].get('battle', {})
+            embed.add_field(name="Cles de battle['battle']", value=(", ".join(b0.keys()))[:1000] or "—", inline=False)
+            embed.add_field(name="1ere bataille",
+                            value=f"type = {b0.get('type')!r}\ntrophyChange = {b0.get('trophyChange')!r}", inline=False)
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logging.error(f"Error in inspect: {e}")
+        await ctx.send(f"Erreur dans !inspect : {e}")
+
+
 # ===========================================================================
 #  ASSISTANT DE DRAFT (avec module ML)
 # ===========================================================================
 # Syntaxe :
 #   !draft <id1> <id2> <id3> <map> | ban: COLT, PIPER | enemy: SHELLY, BULL | ally: SPIKE
 DRAFT_DAYS = 60
- 
+
 @bot.command(name='draft')
 async def command_draft(ctx, id1: str, id2: str, id3: str, *, rest: str = ""):
     logging.info(f"Command {BOT_PREFIX}draft from {ctx.author.name}: {id1} {id2} {id3} | {rest}")
@@ -312,13 +366,13 @@ async def command_draft(ctx, id1: str, id2: str, id3: str, *, rest: str = ""):
         if not map_name:
             await ctx.send("Syntaxe : `!draft <id1> <id2> <id3> <map> | ban: COLT | enemy: SHELLY | ally: SPIKE`")
             return
- 
+
         team_matches = get_team_matches(ids, map_name=map_name, days=DRAFT_DAYS)
         if not team_matches:
             await ctx.send(f"Aucune donnee (Ranked/tournoi) pour ce trio sur **{map_name}** sur {DRAFT_DAYS} jours. "
                            f"Verifie avec `!debug` (nb de lignes) ou `!main {map_name}`.")
             return
- 
+
         # --- Stats descriptives : top 15 joues + winrate ---
         games, wins = Counter(), Counter()
         for m in team_matches:
@@ -330,48 +384,48 @@ async def command_draft(ctx, id1: str, id2: str, id3: str, *, rest: str = ""):
             if r == 'victory':
                 wins[b] += 1
         top15 = games.most_common(15)
- 
+
         # --- Entrainement du modele ---
         battles = build_battles(team_matches)
         samples = battles_to_samples(battles)
         all_brawlers = sorted({b for s, _ in samples for b in s})
         model_info = train_model(samples, all_brawlers)
         mode = "modele ML" if model_info else "winrate (donnees insuffisantes pour le ML)"
- 
+
         taken = {x.upper() for x in (bans + enemies + allies)}
- 
+
         # --- Suggestions ML ---
         picks = suggest_picks(model_info, battles, all_brawlers, allies, taken, games, wins, n=5)
         pick_names = {b for _, b, _ in picks}
         ban_sugg = suggest_bans(model_info, all_brawlers, taken | pick_names, games, wins, n=5)
- 
+
         # --- Construction de l'embed ---
         ctx_bits = []
         if bans: ctx_bits.append(f"bans: {', '.join(bans)}")
         if enemies: ctx_bits.append(f"ennemis: {', '.join(enemies)}")
         if allies: ctx_bits.append(f"allies: {', '.join(allies)}")
         subtitle = " | ".join(ctx_bits) if ctx_bits else "aucun pick/ban renseigne"
- 
+
         embed = discord.Embed(title=f"Draft - {map_name}", description=subtitle,
                               color=discord.Color.from_rgb(255, 69, 0))
- 
+
         top_lines = [f"{i}. {b} — {tot}g ({(wins[b]/tot*100):.0f}%)" for i, (b, tot) in enumerate(top15, 1)]
         embed.add_field(name="Top 15 brawlers joues", value="\n".join(top_lines) or "—", inline=False)
- 
+
         ban_lines = [f"{i}. {b} — force {f*100:.0f} ({g}g)" for i, (f, b, g) in enumerate(ban_sugg, 1)]
         embed.add_field(name=f"Bans conseilles ({mode})", value="\n".join(ban_lines) or "—", inline=False)
- 
+
         pick_lines = [f"{i}. {b} — score {s*100:.0f} ({g}g)" for i, (s, b, g) in enumerate(picks, 1)]
         embed.add_field(name=f"Picks conseilles ({mode})", value="\n".join(pick_lines) or "—", inline=False)
- 
+
         embed.set_footer(text=f"{len(team_matches)} parties / {len(samples)} comps (Ranked/tournoi, {DRAFT_DAYS}j). "
                               f"force = P(victoire) du brawler seul ; score = pick + synergie.")
         await ctx.send(embed=embed)
     except Exception as e:
         logging.error(f"Error in draft: {e}")
         await ctx.send("Une erreur s'est produite dans !draft.")
- 
- 
+
+
 # ===========================================================================
 #  COMMANDE COMPARE (corrigee)
 # ===========================================================================
@@ -386,20 +440,20 @@ async def command_compare(ctx, id1: str, id2: str, id3: str, *, map_name: str):
         if missing:
             await ctx.send(f"ID introuvable(s) dans la feuille Players : {', '.join(missing)}")
             return
- 
+
         team_matches = get_team_matches(ids, map_name=map_name, days=30)
         if not team_matches:
             await ctx.send(f"Aucune partie (Ranked/tournoi) pour ce trio sur **{map_name}** sur 30 jours. "
                            f"Verifie avec `!debug` ou `!main {map_name}`.")
             return
- 
+
         games = Counter(m['BrawlerName'].upper() for m in team_matches
                         if m.get('BrawlerName', '').strip() and m.get('Result', '').strip().lower() in ('victory', 'defeat'))
         wins = Counter(m['BrawlerName'].upper() for m in team_matches if m.get('Result', '').strip().lower() == 'victory')
         if not games:
             await ctx.send("Aucune partie valide (BrawlerName / Result manquants).")
             return
- 
+
         embed = discord.Embed(title=f"Top 15 Brawlers on {map_name}", color=discord.Color.from_rgb(255, 69, 0))
         embed.set_footer(text=f"Requested by {ctx.author.name} at {datetime.datetime.now().strftime('%H:%M:%S %d/%m/%Y')}")
         for i, (brawler, total) in enumerate(games.most_common(15), 1):
@@ -410,8 +464,8 @@ async def command_compare(ctx, id1: str, id2: str, id3: str, *, map_name: str):
     except Exception as e:
         logging.error(f"Error in compare: {e}")
         await ctx.send("Une erreur s'est produite dans la commande.")
- 
- 
+
+
 # ===========================================================================
 #  COMMANDE MAIN
 # ===========================================================================
@@ -437,7 +491,7 @@ async def command_main(ctx, *, map_name: str):
     except Exception as e:
         logging.error(f"Error in main: {e}")
         await ctx.send("Une erreur s'est produite dans la commande.")
- 
- 
+
+
 keep_alive()
 bot.run(DISCORD_TOKEN)
