@@ -1,3 +1,4 @@
+
 import os
 from dotenv import load_dotenv
 import requests
@@ -182,3 +183,4 @@ if __name__ == "__main__":
     prune_old_matches(days=40)  # on purge AVANT d'ajouter pour rester sous la limite
     update_sheet()
     logging.info("Data update completed.")
+ 
