@@ -1,4 +1,3 @@
-
 import os
 import math
 from dotenv import load_dotenv
@@ -13,16 +12,23 @@ from collections import Counter, defaultdict
 import logging
 from keep_alive import keep_alive
  
+# --- ML (optionnel) : si scikit-learn manque, on retombe sur le winrate -----
+try:
+    from sklearn.linear_model import LogisticRegression
+    import numpy as np
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+ 
 load_dotenv()
  
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
  
-# Replace with your actual values
-DISCORD_TOKEN = os.getenv('D')  # Token Discord
-SHEET_ID = os.getenv('G')  # ID de la Google Sheet
+DISCORD_TOKEN = os.getenv('D')
+SHEET_ID = os.getenv('G')
 CREDENTIALS_FILE = 'credentials.json'
-YOUR_CHANNEL_ID = 1403782456108388404  # ID du channel Discord
+YOUR_CHANNEL_ID = 1403782456108388404
  
 BOT_PREFIX = '!'
  
@@ -32,29 +38,29 @@ creds = service_account.Credentials.from_service_account_file(CREDENTIALS_FILE, 
 gs_client = gspread.authorize(creds)
 sheet = gs_client.open_by_key(SHEET_ID)
 players_worksheet = sheet.worksheet('Players')
-matches_worksheet = sheet.worksheet('Matches')  # Headers: PlayerTag, BattleTime, EventMode, EventMap, BrawlerName, Result, TrophyChange, BattleType
+matches_worksheet = sheet.worksheet('Matches')  # PlayerTag, BattleTime, EventMode, EventMap, BrawlerName, Result, TrophyChange, BattleType
  
-# Discord bot setup with intents
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
  
  
 # ===========================================================================
-#  FILTRE LADDER vs RANKED / TOURNOIS
+#  HELPERS GENERAUX
 # ===========================================================================
-# /!\ PIEGE : dans l'API Brawl Stars, le type "ranked" = LADDER (trophees).
-#     Le mode "Ranked" du jeu = "soloRanked" / "teamRanked".
-# On exclut UNIQUEMENT le type ladder ; tout le reste est conserve.
+def normalize_tag(t):
+    """Uniformise un tag joueur en '#XXXX' majuscule (tolere espaces / # manquant)."""
+    return '#' + str(t).strip().lstrip('#').upper()
+ 
+ 
+# /!\ Dans l'API Brawl Stars, "ranked" = LADDER. Le mode "Ranked" = soloRanked/teamRanked.
 LADDER_BATTLE_TYPES = {'ranked'}
  
 def is_ladder_match(m):
-    """True si la partie est du LADDER (a exclure des stats competitives)."""
-    # 1) Methode fiable : colonne BattleType (= battle.type de l'API)
+    """True si la partie est du LADDER (a exclure)."""
     btype = str(m.get('BattleType', '')).strip().lower()
     if btype:
         return btype in LADDER_BATTLE_TYPES
-    # 2) Fallback pour les anciennes lignes sans BattleType : variation de trophees
     raw = str(m.get('TrophyChange', '')).strip()
     if not raw:
         return False
@@ -64,14 +70,8 @@ def is_ladder_match(m):
         return False
  
  
-# ===========================================================================
-#  OUTILS STATS
-# ===========================================================================
 def wilson_lower_bound(wins, total, z=1.96):
-    """
-    Borne basse de l'intervalle de Wilson (95%) : un 'winrate prudent'.
-    Un 3/3 (100% sur 3 games) sera classe plus bas qu'un 40/55 (~73% sur 55).
-    """
+    """Borne basse de Wilson (95%) : winrate prudent qui penalise les petits echantillons."""
     if total <= 0:
         return 0.0
     phat = wins / total
@@ -82,12 +82,12 @@ def wilson_lower_bound(wins, total, z=1.96):
  
  
 def get_team_matches(ids, map_name=None, days=30):
-    """Recupere les matchs (non-ladder) d'un trio, eventuellement sur une map."""
+    """Matchs (non-ladder) d'un trio, eventuellement sur une map. `ids` = set de tags normalises."""
     matches = matches_worksheet.get_all_records()
     cutoff = datetime.datetime.now(datetime.timezone.utc) - timedelta(days=days)
     out = []
     for m in matches:
-        if m.get('PlayerTag', '').upper() not in ids:
+        if normalize_tag(m.get('PlayerTag', '')) not in ids:
             continue
         if is_ladder_match(m):
             continue
@@ -105,96 +105,115 @@ def get_team_matches(ids, map_name=None, days=30):
  
  
 # ===========================================================================
-#  EVENTS
+#  MODULE D'APPRENTISSAGE AUTOMATIQUE
 # ===========================================================================
-@bot.event
-async def on_ready():
-    logging.info(f'Logged in as {bot.user} (ID: {bot.user.id})')
-    logging.info(f'Connected to {len(bot.guilds)} guilds: {[g.name for g in bot.guilds]}')
-    channel = bot.get_channel(YOUR_CHANNEL_ID)
-    if channel:
-        await channel.send(
-            f"Bot online ! Commandes : {BOT_PREFIX}compare, {BOT_PREFIX}main, "
-            f"{BOT_PREFIX}draft, {BOT_PREFIX}debug"
-        )
+# Modele : regression logistique sur les comps reconstituees (multi-hot brawlers)
+#          -> P(victoire). Sert a noter la FORCE d'un brawler (bans) et a evaluer
+#          un PICK. Avec peu de donnees elle apprend surtout des forces regularisees,
+#          donc les picks sont blendes avec la synergie observee.
+MODEL_MIN_SAMPLES = 40   # nb de parties mini pour entrainer (sinon fallback winrate)
+MODEL_C = 0.3            # regularisation L2 (petit = plus fort, anti-overfit)
+W_MODEL = 0.6            # poids du modele dans le score de pick
+W_SYNERGY = 0.4          # poids de la synergie observee dans le score de pick
  
-@bot.event
-async def on_message(message):
-    if message.author == bot.user:
-        return
-    logging.info(f"Message: {message.content} from {message.author.name} in {message.channel.id}")
-    await bot.process_commands(message)
+def build_battles(team_matches):
+    """Regroupe les lignes par BattleTime -> {tag: (brawler, result)} (coequipiers = meme heure)."""
+    battles = defaultdict(dict)
+    for m in team_matches:
+        tag = normalize_tag(m.get('PlayerTag', ''))
+        b = m.get('BrawlerName', '').upper()
+        r = m.get('Result', '').lower()
+        if b and r in ('victory', 'defeat'):
+            battles[m['BattleTime']][tag] = (b, r)
+    return battles
  
-@bot.event
-async def on_command_error(ctx, error):
-    logging.error(f"Command error: {error}")
-    await ctx.send(f"Error: {str(error)}")
+def battles_to_samples(battles):
+    """Chaque partie -> (set de brawlers de notre cote, 1=win/0=loss)."""
+    samples = []
+    for players in battles.values():
+        brawlers = {br for br, _ in players.values()}
+        res = next(iter(players.values()))[1]
+        if brawlers:
+            samples.append((brawlers, 1 if res == 'victory' else 0))
+    return samples
  
+def comp_winrate(battles, required):
+    """Winrate des parties ou tous les brawlers `required` etaient presents."""
+    req = {x.upper() for x in required}
+    g = w = 0
+    for players in battles.values():
+        comp = {br for br, _ in players.values()}
+        if req.issubset(comp):
+            g += 1
+            if next(iter(players.values()))[1] == 'victory':
+                w += 1
+    return w, g
  
-# ===========================================================================
-#  COMMANDE DEBUG  ->  a lancer pour diagnostiquer la feuille
-# ===========================================================================
-@bot.command(name='debug')
-async def command_debug(ctx):
-    logging.info(f"Command {BOT_PREFIX}debug from {ctx.author.name}")
+def train_model(samples, all_brawlers):
+    """Entraine la regression logistique. Retourne (model, idx) ou None si impossible."""
+    if not SKLEARN_AVAILABLE or len(samples) < MODEL_MIN_SAMPLES or not all_brawlers:
+        return None
+    y = [w for _, w in samples]
+    if len(set(y)) < 2:   # besoin de victoires ET defaites
+        return None
+    idx = {b: i for i, b in enumerate(all_brawlers)}
+    X = np.zeros((len(samples), len(idx)))
+    for r, (brawlers, _) in enumerate(samples):
+        for b in brawlers:
+            if b in idx:
+                X[r, idx[b]] = 1.0
     try:
-        matches = matches_worksheet.get_all_records()
-        total = len(matches)
-        if total == 0:
-            await ctx.send("La feuille Matches est vide.")
-            return
- 
-        keys = list(matches[0].keys())
- 
-        tc = Counter()
-        for m in matches:
-            raw = str(m.get('TrophyChange', '')).strip()
-            if raw == '':
-                tc['vide'] += 1
-            elif raw in ('0', '0.0'):
-                tc['zero'] += 1
-            else:
-                tc['non-zero'] += 1
- 
-        has_bt = 'BattleType' in keys
-        bt = Counter()
-        if has_bt:
-            for m in matches:
-                bt[str(m.get('BattleType', '')).strip().lower() or '(vide)'] += 1
- 
-        nb_ladder = sum(1 for m in matches if is_ladder_match(m))
- 
-        embed = discord.Embed(title="Debug - donnees Matches", color=discord.Color.orange())
-        embed.add_field(name="Lignes totales", value=str(total), inline=False)
-        embed.add_field(name="Colonnes detectees", value=", ".join(keys), inline=False)
-        embed.add_field(
-            name="TrophyChange",
-            value=f"vide: {tc['vide']} | zero: {tc['zero']} | non-zero: {tc['non-zero']}",
-            inline=False
-        )
-        if has_bt:
-            top_bt = " | ".join(f"{k}: {v}" for k, v in bt.most_common(8))
-            embed.add_field(name="BattleType (valeurs)", value=top_bt or "(vide)", inline=False)
-        else:
-            embed.add_field(name="BattleType", value="ABSENTE (ajoute l'en-tete colonne H)", inline=False)
-        embed.add_field(name="Parties classees 'ladder' (exclues)", value=f"{nb_ladder} / {total}", inline=False)
-        await ctx.send(embed=embed)
+        model = LogisticRegression(C=MODEL_C, max_iter=2000)
+        model.fit(X, np.array(y, dtype=float))
     except Exception as e:
-        logging.error(f"Error in debug: {e}")
-        await ctx.send("Une erreur s'est produite dans !debug.")
+        logging.error(f"train_model failed: {e}")
+        return None
+    return (model, idx)
+ 
+def model_winprob(model_info, comp):
+    """P(victoire) predite par le modele pour une comp (set de brawlers)."""
+    model, idx = model_info
+    x = np.zeros((1, len(idx)))
+    for b in comp:
+        if b in idx:
+            x[0, idx[b]] = 1.0
+    return float(model.predict_proba(x)[0][1])
+ 
+def suggest_bans(model_info, all_brawlers, taken, games, wins, n=5, min_games=3):
+    """Bans = brawlers les plus FORTS sur la map (a refuser a l'adversaire)."""
+    cands = [b for b in all_brawlers if b not in taken and games[b] >= min_games]
+    scored = []
+    for b in cands:
+        force = model_winprob(model_info, {b}) if model_info else wilson_lower_bound(wins[b], games[b])
+        scored.append((force, b, games[b]))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return scored[:n]
+ 
+def suggest_picks(model_info, battles, all_brawlers, allies, taken, games, wins, n=5, min_games=2):
+    """Picks = meilleurs completements de VOTRE comp (modele + synergie observee)."""
+    ally_set = {a.upper() for a in allies}
+    cands = [b for b in all_brawlers if b not in taken and games[b] >= min_games]
+    if len(cands) < n:
+        cands = [b for b in all_brawlers if b not in taken]
+    scored = []
+    for b in cands:
+        if ally_set:
+            syn_w, syn_g = comp_winrate(battles, ally_set | {b})
+        else:
+            syn_w, syn_g = wins[b], games[b]
+        syn_score = wilson_lower_bound(syn_w, syn_g)
+        if model_info:
+            score = W_MODEL * model_winprob(model_info, ally_set | {b}) + W_SYNERGY * syn_score
+        else:
+            score = syn_score
+        scored.append((score, b, syn_g))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return scored[:n]
  
  
 # ===========================================================================
-#  ASSISTANT DE DRAFT
+#  PARSING DRAFT
 # ===========================================================================
-# Syntaxe :
-#   !draft <id1> <id2> <id3> <map> | ban: COLT, PIPER | enemy: SHELLY, BULL | ally: SPIKE
-# Tout ce qui suit la map est optionnel.
-DRAFT_DAYS = 30          # fenetre d'historique
-DRAFT_MIN_GAMES = 3      # nb de games mini pour conseiller un brawler
-W_MAP = 0.65             # poids du winrate sur la map
-W_SYN = 0.35             # poids de la synergie avec les allies deja pick
- 
 def parse_draft_args(raw):
     """Parse '<map> | ban: ... | enemy: ... | ally: ...' (FR/EN toleres)."""
     map_name, bans, enemies, allies = None, [], [], []
@@ -218,23 +237,89 @@ def parse_draft_args(raw):
     return map_name, bans, enemies, allies
  
  
+# ===========================================================================
+#  EVENTS
+# ===========================================================================
+@bot.event
+async def on_ready():
+    logging.info(f'Logged in as {bot.user} (ID: {bot.user.id})')
+    logging.info(f'ML disponible: {SKLEARN_AVAILABLE}')
+    channel = bot.get_channel(YOUR_CHANNEL_ID)
+    if channel:
+        await channel.send(
+            f"Bot online ! Commandes : {BOT_PREFIX}compare, {BOT_PREFIX}main, "
+            f"{BOT_PREFIX}draft, {BOT_PREFIX}debug"
+        )
+ 
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+    logging.info(f"Message: {message.content} from {message.author.name} in {message.channel.id}")
+    await bot.process_commands(message)
+ 
+@bot.event
+async def on_command_error(ctx, error):
+    logging.error(f"Command error: {error}")
+    await ctx.send(f"Error: {str(error)}")
+ 
+ 
+# ===========================================================================
+#  COMMANDE DEBUG
+# ===========================================================================
+@bot.command(name='debug')
+async def command_debug(ctx):
+    try:
+        matches = matches_worksheet.get_all_records()
+        total = len(matches)
+        if total == 0:
+            await ctx.send("La feuille Matches est vide.")
+            return
+        keys = list(matches[0].keys())
+        bt = Counter()
+        if 'BattleType' in keys:
+            for m in matches:
+                bt[str(m.get('BattleType', '')).strip().lower() or '(vide)'] += 1
+        nb_ladder = sum(1 for m in matches if is_ladder_match(m))
+        embed = discord.Embed(title="Debug - donnees Matches", color=discord.Color.orange())
+        embed.add_field(name="Lignes totales", value=str(total), inline=False)
+        embed.add_field(name="Colonnes", value=", ".join(keys), inline=False)
+        if bt:
+            embed.add_field(name="BattleType", value=" | ".join(f"{k}: {v}" for k, v in bt.most_common(8)), inline=False)
+        else:
+            embed.add_field(name="BattleType", value="ABSENTE (ajoute l'en-tete colonne H)", inline=False)
+        embed.add_field(name="Classees 'ladder' (exclues)", value=f"{nb_ladder} / {total}", inline=False)
+        embed.add_field(name="Module ML", value="actif" if SKLEARN_AVAILABLE else "inactif (scikit-learn absent)", inline=False)
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logging.error(f"Error in debug: {e}")
+        await ctx.send("Une erreur s'est produite dans !debug.")
+ 
+ 
+# ===========================================================================
+#  ASSISTANT DE DRAFT (avec module ML)
+# ===========================================================================
+# Syntaxe :
+#   !draft <id1> <id2> <id3> <map> | ban: COLT, PIPER | enemy: SHELLY, BULL | ally: SPIKE
+DRAFT_DAYS = 60
+ 
 @bot.command(name='draft')
 async def command_draft(ctx, id1: str, id2: str, id3: str, *, rest: str = ""):
     logging.info(f"Command {BOT_PREFIX}draft from {ctx.author.name}: {id1} {id2} {id3} | {rest}")
     try:
-        ids = {id1.upper(), id2.upper(), id3.upper()}
+        ids = {normalize_tag(id1), normalize_tag(id2), normalize_tag(id3)}
         map_name, bans, enemies, allies = parse_draft_args(rest)
- 
         if not map_name:
             await ctx.send("Syntaxe : `!draft <id1> <id2> <id3> <map> | ban: COLT | enemy: SHELLY | ally: SPIKE`")
             return
  
         team_matches = get_team_matches(ids, map_name=map_name, days=DRAFT_DAYS)
         if not team_matches:
-            await ctx.send(f"Aucune donnee (Ranked/tournoi) pour ce trio sur **{map_name}** sur {DRAFT_DAYS} jours.")
+            await ctx.send(f"Aucune donnee (Ranked/tournoi) pour ce trio sur **{map_name}** sur {DRAFT_DAYS} jours. "
+                           f"Verifie avec `!debug` (nb de lignes) ou `!main {map_name}`.")
             return
  
-        # --- Winrate solo par brawler sur la map ---
+        # --- Stats descriptives : top 15 joues + winrate ---
         games, wins = Counter(), Counter()
         for m in team_matches:
             b = m.get('BrawlerName', '').upper()
@@ -244,67 +329,43 @@ async def command_draft(ctx, id1: str, id2: str, id3: str, *, rest: str = ""):
             games[b] += 1
             if r == 'victory':
                 wins[b] += 1
+        top15 = games.most_common(15)
  
-        # --- Reconstruction des comps via BattleTime (coequipiers = meme heure) ---
-        battles = defaultdict(dict)  # BattleTime -> {tag: (brawler, result)}
-        for m in team_matches:
-            tag = m.get('PlayerTag', '').upper()
-            b = m.get('BrawlerName', '').upper()
-            r = m.get('Result', '').lower()
-            if tag and b:
-                battles[m['BattleTime']][tag] = (b, r)
+        # --- Entrainement du modele ---
+        battles = build_battles(team_matches)
+        samples = battles_to_samples(battles)
+        all_brawlers = sorted({b for s, _ in samples for b in s})
+        model_info = train_model(samples, all_brawlers)
+        mode = "modele ML" if model_info else "winrate (donnees insuffisantes pour le ML)"
  
-        def comp_winrate(required):
-            req = set(x.upper() for x in required)
-            g = w = 0
-            for players in battles.values():
-                comp = {br for br, _ in players.values()}
-                if req.issubset(comp):
-                    g += 1
-                    if next(iter(players.values()))[1] == 'victory':
-                        w += 1
-            return w, g
+        taken = {x.upper() for x in (bans + enemies + allies)}
  
-        # --- Pool de candidats (on retire bans, picks ennemis et allies) ---
-        unavailable = {x.upper() for x in (bans + enemies + allies)}
-        pool = [b for b in games if b not in unavailable]
-        eligible = [b for b in pool if games[b] >= DRAFT_MIN_GAMES]
-        if len(eligible) < 3:
-            eligible = pool
-        if not eligible:
-            await ctx.send("Aucun brawler conseillable (tout est banni/pris ou pas assez de donnees).")
-            return
+        # --- Suggestions ML ---
+        picks = suggest_picks(model_info, battles, all_brawlers, allies, taken, games, wins, n=5)
+        pick_names = {b for _, b, _ in picks}
+        ban_sugg = suggest_bans(model_info, all_brawlers, taken | pick_names, games, wins, n=5)
  
-        # --- Scoring : winrate map (prudent) + synergie avec les allies ---
-        results = []
-        for b in eligible:
-            map_wr = wins[b] / games[b]
-            syn_w, syn_g = comp_winrate(allies + [b]) if allies else (0, 0)
-            syn_wr = (syn_w / syn_g) if syn_g else 0.0
-            score = (W_MAP * wilson_lower_bound(wins[b], games[b])
-                     + W_SYN * wilson_lower_bound(syn_w, syn_g))
-            results.append((score, b, map_wr, games[b], syn_wr, syn_g))
- 
-        results.sort(reverse=True)
-        top = results[:6]
- 
+        # --- Construction de l'embed ---
         ctx_bits = []
         if bans: ctx_bits.append(f"bans: {', '.join(bans)}")
         if enemies: ctx_bits.append(f"ennemis: {', '.join(enemies)}")
         if allies: ctx_bits.append(f"allies: {', '.join(allies)}")
-        subtitle = " | ".join(ctx_bits) if ctx_bits else "aucun contexte de draft fourni"
+        subtitle = " | ".join(ctx_bits) if ctx_bits else "aucun pick/ban renseigne"
  
         embed = discord.Embed(title=f"Draft - {map_name}", description=subtitle,
                               color=discord.Color.from_rgb(255, 69, 0))
-        for i, (score, b, map_wr, g, syn_wr, syn_g) in enumerate(top, 1):
-            flag = " (peu de games)" if g < 5 else ""
-            line = f"Map WR **{map_wr*100:.0f}%** ({g}g)"
-            if allies and syn_g:
-                line += f" | Synergie {syn_wr*100:.0f}% ({syn_g}g)"
-            embed.add_field(name=f"{i}. {b}  -  score {score:.2f}{flag}", value=line, inline=False)
  
-        embed.set_footer(text=f"Base sur {len(team_matches)} parties (Ranked/tournoi, {DRAFT_DAYS}j). "
-                              f"Demande par {ctx.author.name}")
+        top_lines = [f"{i}. {b} — {tot}g ({(wins[b]/tot*100):.0f}%)" for i, (b, tot) in enumerate(top15, 1)]
+        embed.add_field(name="Top 15 brawlers joues", value="\n".join(top_lines) or "—", inline=False)
+ 
+        ban_lines = [f"{i}. {b} — force {f*100:.0f} ({g}g)" for i, (f, b, g) in enumerate(ban_sugg, 1)]
+        embed.add_field(name=f"Bans conseilles ({mode})", value="\n".join(ban_lines) or "—", inline=False)
+ 
+        pick_lines = [f"{i}. {b} — score {s*100:.0f} ({g}g)" for i, (s, b, g) in enumerate(picks, 1)]
+        embed.add_field(name=f"Picks conseilles ({mode})", value="\n".join(pick_lines) or "—", inline=False)
+ 
+        embed.set_footer(text=f"{len(team_matches)} parties / {len(samples)} comps (Ranked/tournoi, {DRAFT_DAYS}j). "
+                              f"force = P(victoire) du brawler seul ; score = pick + synergie.")
         await ctx.send(embed=embed)
     except Exception as e:
         logging.error(f"Error in draft: {e}")
@@ -312,48 +373,39 @@ async def command_draft(ctx, id1: str, id2: str, id3: str, *, rest: str = ""):
  
  
 # ===========================================================================
-#  COMMANDE COMPARE
+#  COMMANDE COMPARE (corrigee)
 # ===========================================================================
 @bot.command(name='compare')
 async def command_compare(ctx, id1: str, id2: str, id3: str, *, map_name: str):
     logging.info(f"Command {BOT_PREFIX}compare from {ctx.author.name}: {id1}, {id2}, {id3}, {map_name}")
     try:
-        players = [row[0] for row in players_worksheet.get_all_values()[1:]]
-        ids = [id1.upper(), id2.upper(), id3.upper()]
-        if any(p not in players for p in ids):
-            logging.warning(f"Mismatch: IDs {ids} not in {players}")
-            await ctx.send('id manquant')
+        sheet_players = {normalize_tag(row[0]) for row in players_worksheet.get_all_values()[1:]
+                         if row and row[0].strip()}
+        ids = {normalize_tag(id1), normalize_tag(id2), normalize_tag(id3)}
+        missing = [i for i in ids if i not in sheet_players]
+        if missing:
+            await ctx.send(f"ID introuvable(s) dans la feuille Players : {', '.join(missing)}")
             return
  
-        matches = matches_worksheet.get_all_records()
-        thirty_days_ago = datetime.datetime.now(datetime.timezone.utc) - timedelta(days=30)
- 
-        filtered = [m for m in matches if m['PlayerTag'].upper() in ids
-                    and m['EventMap'].lower() == map_name.lower()
-                    and parse(m['BattleTime']) > thirty_days_ago
-                    and m.get('EventMode', '').lower() not in ['solo showdown', 'duo showdown']
-                    and not is_ladder_match(m)]
-        logging.info(f"Filtered matches count: {len(filtered)}")
-        if not filtered:
-            await ctx.send('No matches found for these players on this map in the last 30 days (Ranked/tournois uniquement).')
+        team_matches = get_team_matches(ids, map_name=map_name, days=30)
+        if not team_matches:
+            await ctx.send(f"Aucune partie (Ranked/tournoi) pour ce trio sur **{map_name}** sur 30 jours. "
+                           f"Verifie avec `!debug` ou `!main {map_name}`.")
             return
  
-        valid_matches = [m for m in filtered if m.get('BrawlerName', '').strip()
-                         and m.get('Result', '').strip().lower() in ['victory', 'defeat']]
-        if not valid_matches:
-            await ctx.send("No valid matches found with required data (BrawlerName and Result).")
+        games = Counter(m['BrawlerName'].upper() for m in team_matches
+                        if m.get('BrawlerName', '').strip() and m.get('Result', '').strip().lower() in ('victory', 'defeat'))
+        wins = Counter(m['BrawlerName'].upper() for m in team_matches if m.get('Result', '').strip().lower() == 'victory')
+        if not games:
+            await ctx.send("Aucune partie valide (BrawlerName / Result manquants).")
             return
  
-        brawler_stats = Counter(m['BrawlerName'].upper() for m in valid_matches)
-        brawler_wins = Counter(m['BrawlerName'].upper() for m in valid_matches if m['Result'].lower() == 'victory')
- 
-        top_15 = brawler_stats.most_common(15)
         embed = discord.Embed(title=f"Top 15 Brawlers on {map_name}", color=discord.Color.from_rgb(255, 69, 0))
         embed.set_footer(text=f"Requested by {ctx.author.name} at {datetime.datetime.now().strftime('%H:%M:%S %d/%m/%Y')}")
-        for i, (brawler, total) in enumerate(top_15, 1):
-            w = brawler_wins.get(brawler, 0)
-            winrate = (w / total * 100) if total > 0 else 0
-            embed.add_field(name=f"{i}. {brawler}", value=f"Used {total} times | Winrate: {winrate:.1f}% ({w} wins)", inline=False)
+        for i, (brawler, total) in enumerate(games.most_common(15), 1):
+            w = wins.get(brawler, 0)
+            wr = (w / total * 100) if total else 0
+            embed.add_field(name=f"{i}. {brawler}", value=f"Used {total} times | Winrate: {wr:.1f}% ({w} wins)", inline=False)
         await ctx.send(embed=embed)
     except Exception as e:
         logging.error(f"Error in compare: {e}")
@@ -369,7 +421,6 @@ async def command_main(ctx, *, map_name: str):
     try:
         matches = matches_worksheet.get_all_records()
         fifteen_days_ago = datetime.datetime.now(datetime.timezone.utc) - timedelta(days=15)
- 
         filtered = [m for m in matches if m.get('EventMap', '').lower() == map_name.lower()
                     and parse(m['BattleTime']) > fifteen_days_ago
                     and m.get('EventMode', '').lower() not in ['solo showdown', 'duo showdown']
@@ -377,13 +428,10 @@ async def command_main(ctx, *, map_name: str):
         if not filtered:
             await ctx.send('No matches found for this map in the last 15 days (Ranked/tournois uniquement).')
             return
- 
         brawler_count = Counter(m['BrawlerName'].upper() for m in filtered if m.get('BrawlerName'))
-        top_15 = brawler_count.most_common(15)
- 
         embed = discord.Embed(title=f"Top 15 Brawlers on {map_name} (last 15 days)", color=discord.Color.from_rgb(255, 69, 0))
         embed.set_footer(text=f"Requested by {ctx.author.name} at {datetime.datetime.now().strftime('%H:%M:%S %d/%m/%Y')}")
-        for i, (brawler, count) in enumerate(top_15, 1):
+        for i, (brawler, count) in enumerate(brawler_count.most_common(15), 1):
             embed.add_field(name=f"{i}. {brawler}", value=f"Used {count} times", inline=False)
         await ctx.send(embed=embed)
     except Exception as e:
@@ -393,4 +441,3 @@ async def command_main(ctx, *, map_name: str):
  
 keep_alive()
 bot.run(DISCORD_TOKEN)
- 
