@@ -9,3 +9,4 @@ requests
 aiohttp
 gspread
 gspread_asyncio
+scikit-learn
